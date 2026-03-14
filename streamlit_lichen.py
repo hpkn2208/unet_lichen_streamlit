@@ -41,16 +41,10 @@ if not uploaded_files:
 # Most recent uploads first
 uploaded_files = list(uploaded_files)[::-1]
 
-# st.markdown("### Uploaded Images")
-# for uploaded in uploaded_files:
-#     st.write(f"- {uploaded.name}")
-
-# st.markdown("---")
-
 # display in grid with uniform spacing
-row_cols = 5
+row_cols = 4
 for i in range(0, len(uploaded_files), row_cols):
-    cols = st.columns(row_cols, gap="large")
+    cols = st.columns(row_cols, gap="small", vertical_alignment="top", border=True)
     for j, uploaded in enumerate(uploaded_files[i:i+row_cols]):
         img = Image.open(uploaded).convert("RGB")
         arr = np.array(img)
@@ -69,16 +63,17 @@ for i in range(0, len(uploaded_files), row_cols):
         overlay = arr.copy()
         red_mask = np.zeros_like(overlay)
         red_mask[pred_resized == 255] = [255, 0, 0]
-        overlay = (overlay * 0.7 + red_mask * 0.3).astype(np.uint8)
+        overlay = (overlay * 0.8 + red_mask * 0.2).astype(np.uint8)
 
         col = cols[j]
         with col:
             st.markdown(f"#### {uploaded.name}")
             st.image(arr, caption="Uploaded image", width=350)
             if pred_resized.max() > 0:
-                st.markdown('<span style="color:red; font-weight:bold">Predicted lichen</span>', unsafe_allow_html=True)
+                st.markdown('<span style="color:red; font-weight:bold">Model predicted: lichen</span>', unsafe_allow_html=True)
+                st.image(overlay, caption="Overlay", width=350)
             else:
-                st.markdown('<span style="color:green; font-weight:bold">Predicted normal</span>', unsafe_allow_html=True)
-            st.image(overlay, caption="Overlay", width=350)
+                st.markdown('<span style="color:green; font-weight:bold">Model predicted: normal</span>', unsafe_allow_html=True)
+                st.image(overlay, caption="No oral lesion found", width=350)
 
 st.success("Done. Predictions shown above.")
