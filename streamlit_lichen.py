@@ -4,12 +4,25 @@ import numpy as np
 import torch
 import segmentation_models_pytorch as smp
 from PIL import Image
+import io
+import base64
 
-st.set_page_config(page_title="Oral Lichen Detector", layout="wide")
+st.set_page_config(page_title="Oral Lichen Segmentation Demo", layout="wide")
 
 st.title("Oral Lichen Segmentation Demo")
 st.write("Upload one or more images, then run the model to see lichen overlay predictions.")
-st.markdown("<style>.stImage > img {display: block; margin-left: auto; margin-right: auto;}</style>", unsafe_allow_html=True)
+
+def show_responsive_image(arr, caption=None):
+    im = Image.fromarray(arr)
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    data = base64.b64encode(buf.getvalue()).decode("utf-8")
+    html = "<div style='text-align:center; margin:4px 0;'>"
+    html += f"<img src='data:image/png;base64,{data}' style='max-width:100%;height:auto;border-radius:8px;'/>"
+    if caption:
+        html += f"<div style='font-size:13px; color:#ccc; margin-top:4px;'>{caption}</div>"
+    html += "</div>"
+    st.markdown(html, unsafe_allow_html=True)
 
 model_path = st.text_input("Model checkpoint path", "model.pth")
 
@@ -68,12 +81,12 @@ for i in range(0, len(uploaded_files), row_cols):
         col = cols[j]
         with col:
             st.markdown(f"#### {uploaded.name}")
-            st.image(arr, caption="Uploaded image", width=350)
+            show_responsive_image(arr, caption="Uploaded image")
             if pred_resized.max() > 0:
                 st.markdown('<span style="color:red; font-weight:bold">Model predicted: lichen</span>', unsafe_allow_html=True)
-                st.image(overlay, caption="Overlay", width=350)
+                show_responsive_image(overlay, caption="Overlay")
             else:
                 st.markdown('<span style="color:green; font-weight:bold">Model predicted: normal</span>', unsafe_allow_html=True)
-                st.image(overlay, caption="No oral lesion found", width=350)
+                show_responsive_image(overlay, caption="No oral lesion found")
 
 st.success("Done. Predictions shown above.")
