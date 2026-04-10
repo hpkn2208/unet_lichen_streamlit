@@ -6,3 +6,4 @@ numpy
 Pillow
 segmentation-models-pytorch
 scikit-image
+timm
