@@ -15,7 +15,7 @@ import base64
 # Force CPU mode to avoid GPU memory issues
 # Set to 'cuda' if you have sufficient GPU memory and paging file
 # ---------------------------------------------------------
-os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Disable GPU
+# os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Disable GPU
 
 # ---------------------------------------------------------
 # Developer notes / maintenance checkpoints
@@ -136,7 +136,7 @@ def load_unet(path, model_type="unet"):
     if not os.path.exists(path):
         return None, ["Checkpoint path does not exist."]
 
-    checkpoint = torch.load(path, map_location="cpu")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if "state_dict" in checkpoint:
         state_dict = checkpoint["state_dict"]
     else:
@@ -205,7 +205,7 @@ def load_classifier(path, arch):
     else:
         return None
 
-    checkpoint = torch.load(path, map_location="cpu")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if "state_dict" in checkpoint:
         state_dict = checkpoint["state_dict"]
     else:
@@ -227,8 +227,8 @@ class FeatureExtractor(nn.Module):
     def __init__(self, num_classes=3):
         super(FeatureExtractor, self).__init__()
         
-        # Load pre-trained EfficientNet-B0
-        self.model = models.efficientnet_b0(pretrained=True)
+        # Load pre-trained EfficientNet-B0 with proper weights parameter (deprecated 'pretrained' parameter)
+        self.model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
         
         # Store features from penultimate layer
         self.features = None
@@ -258,7 +258,7 @@ def load_stage2_classifier(path):
         return None, None
     
     try:
-        checkpoint = torch.load(path, map_location="cpu")
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         
         model = FeatureExtractor(num_classes=3)
         
