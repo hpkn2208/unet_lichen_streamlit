@@ -12,6 +12,12 @@ import io
 import base64
 
 # ---------------------------------------------------------
+# Force CPU mode to avoid GPU memory issues
+# Set to 'cuda' if you have sufficient GPU memory and paging file
+# ---------------------------------------------------------
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Disable GPU
+
+# ---------------------------------------------------------
 # Developer notes / maintenance checkpoints
 # - `model_path` points to the U-Net checkpoint file.
 # - `classifier_path` points to the oral/non-oral classifier checkpoint.
@@ -57,19 +63,19 @@ else:
 
 model_path = f"model/{segmentation_checkpoint}"
 
-# Classifier settings
-st.subheader("Classifier Settings")
-use_classifier = st.checkbox("Use Oral/Non-oral Classifier", value=True, help="Enable pre-filtering with oral image classifier")
+# Classifier settings - STAGE 1 (Oral/Non-oral)
+st.subheader("Stage 1: Oral/Non-oral Classifier")
+use_stage1_classifier = st.checkbox("Enable Stage 1 (Oral/Non-oral filter)", value=True, help="Enable pre-filtering with oral image classifier")
 
 classifier_path = None
 classifier_arch = None
-if use_classifier:
+if use_stage1_classifier:
     classifier_checkpoint = st.selectbox(
-        "Classifier model",
+        "Stage 1 Classifier model",
         ["oral_classifier_mobilenetv3_small_100.pth", "oral_classifier_resnet18.pth", 
          "oral_classifier_resnet34.pth", "oral_classifier_resnet50.pth"],
         index=0,
-        help="Select which classifier model to use"
+        help="Select which classifier model to use for oral/non-oral classification"
     )
     
     # Auto-detect architecture from checkpoint name
@@ -84,16 +90,35 @@ if use_classifier:
     
     classifier_path = f"model/{classifier_checkpoint}"
 
+# Classifier settings - STAGE 2 (Disease Classification)
+st.subheader("Stage 2: Disease Classifier (Normal | Lichen Planus | Other)")
+use_stage2_classifier = st.checkbox("Enable Stage 2 (Disease classification)", value=True, help="Enable disease classification (Normal/Lichen Planus/Other)")
+
+stage2_classifier_path = None
+if use_stage2_classifier:
+    stage2_checkpoint = st.selectbox(
+        "Stage 2 Classifier model",
+        ["stage2_classifier.pth"],
+        index=0,
+        help="Select Stage 2 disease classifier model"
+    )
+    stage2_classifier_path = f"model/{stage2_checkpoint}"
+
 # Thresholds
 st.subheader("Detection Thresholds")
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 with col1:
-    if use_classifier:
-        classification_threshold = st.slider("Classification threshold", 0.0, 1.0, 0.8, 0.01)
+    if use_stage1_classifier:
+        stage1_threshold = st.slider("Stage 1 threshold", 0.0, 1.0, 0.8, 0.01, help="Confidence threshold for oral classification")
     else:
-        classification_threshold = 0.5
+        stage1_threshold = 0.5
 with col2:
-    segmentation_threshold = st.slider("Segmentation threshold", 0.0, 1.0, 0.7, 0.01)
+    if use_stage2_classifier:
+        stage2_threshold = st.slider("Stage 2 threshold", 0.0, 1.0, 0.7, 0.01, help="Confidence threshold for disease classification")
+    else:
+        stage2_threshold = 0.5
+with col3:
+    segmentation_threshold = st.slider("Stage 3 threshold", 0.0, 1.0, 0.7, 0.01, help="Confidence threshold for segmentation")
 
 status = st.empty()
 
@@ -190,6 +215,76 @@ def load_classifier(path, arch):
     return model
 
 
+# ---------------------------------------------------------
+# Stage 2 Disease Classifier (Normal | Lichen Planus | Other)
+# ---------------------------------------------------------
+
+class FeatureExtractor(nn.Module):
+    """
+    EfficientNet-B0 with feature extraction hook
+    Extracts features from penultimate layer for t-SNE visualization
+    """
+    def __init__(self, num_classes=3):
+        super(FeatureExtractor, self).__init__()
+        
+        # Load pre-trained EfficientNet-B0
+        self.model = models.efficientnet_b0(pretrained=True)
+        
+        # Store features from penultimate layer
+        self.features = None
+        
+        # Register forward hook to capture penultimate layer outputs
+        self.model.avgpool.register_forward_hook(self._hook_fn)
+        
+        # Modify classification head for 3 classes
+        num_features = self.model.classifier[1].in_features
+        self.model.classifier = nn.Sequential(
+            nn.Dropout(p=0.2, inplace=True),
+            nn.Linear(num_features, num_classes)
+        )
+    
+    def _hook_fn(self, module, input, output):
+        """Hook function to capture features from penultimate layer"""
+        self.features = output
+    
+    def forward(self, x):
+        return self.model(x)
+
+
+@st.cache_resource
+def load_stage2_classifier(path):
+    """Load the Stage 2 disease classifier (Normal | Lichen Planus | Other)"""
+    if not path or not os.path.exists(path):
+        return None, None
+    
+    try:
+        checkpoint = torch.load(path, map_location="cpu")
+        
+        model = FeatureExtractor(num_classes=3)
+        
+        if "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        elif "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        else:
+            state_dict = checkpoint
+        
+        model.load_state_dict(state_dict, strict=False)
+        model.eval()
+        
+        # Extract class mapping if available
+        class_mapping = None
+        if "class_mapping" in checkpoint:
+            class_mapping = checkpoint["class_mapping"]
+        else:
+            class_mapping = {0: "Normal", 1: "Lichen Planus", 2: "Other"}
+        
+        return model, class_mapping
+    except Exception as e:
+        st.warning(f"Error loading Stage 2 classifier: {e}")
+        return None, None
+
+
 def preprocess_image(img, size):
     # Preprocessing must match training normalization for both classifier and U-Net.
     img = img.resize((size, size))
@@ -203,7 +298,9 @@ def preprocess_image(img, size):
 # Load models
 # ---------------------------------------------------------
 unet_model, unet_warnings = load_unet(model_path, segmentation_model_type)
-classifier_model = None
+stage1_classifier_model = None
+stage2_classifier_model = None
+stage2_class_mapping = None
 
 if unet_model is None:
     st.warning("U-Net model checkpoint not found. Upload or place the model in the same folder.")
@@ -218,18 +315,31 @@ st.markdown(
     f"**Segmentation architecture:** `{'U-Net' if segmentation_model_type == 'unet' else 'U-Net++'}`"
 )
 
-if use_classifier and classifier_path and classifier_arch:
-    classifier_model = load_classifier(classifier_path, classifier_arch)
-    if classifier_model is not None:
-        st.success("Classifier checkpoint loaded successfully.")
-        st.markdown(f"**Loaded classifier:** `{classifier_path}` → `{classifier_arch}`")
+if use_stage1_classifier and classifier_path and classifier_arch:
+    stage1_classifier_model = load_classifier(classifier_path, classifier_arch)
+    if stage1_classifier_model is not None:
+        st.success("Stage 1 classifier loaded successfully.")
+        st.markdown(f"**Stage 1 (Oral/Non-oral):** `{classifier_path}` → `{classifier_arch}`")
     else:
-        st.warning("Classifier checkpoint not found or invalid. Running segmentation only.")
-        classifier_model = None
-elif use_classifier:
-    st.info("Classifier enabled but no model selected.")
+        st.warning("Stage 1 classifier checkpoint not found or invalid.")
+        stage1_classifier_model = None
+elif use_stage1_classifier:
+    st.info("Stage 1 enabled but no model selected.")
 else:
-    st.info("Classifier disabled. Running U-Net on all uploaded images.")
+    st.info("Stage 1 disabled. Running on all uploaded images.")
+
+if use_stage2_classifier and stage2_classifier_path:
+    stage2_classifier_model, stage2_class_mapping = load_stage2_classifier(stage2_classifier_path)
+    if stage2_classifier_model is not None:
+        st.success("Stage 2 disease classifier loaded successfully.")
+        st.markdown(f"**Stage 2 (Disease Classification):** `{stage2_classifier_path}`  \nClasses: Normal | Lichen Planus | Other")
+    else:
+        st.warning("Stage 2 classifier checkpoint not found. Running Stage 1 + segmentation only.")
+        stage2_classifier_model = None
+elif use_stage2_classifier:
+    st.info("Stage 2 enabled but no model found.")
+else:
+    st.info("Stage 2 disabled.")
 
 uploaded_files = st.file_uploader("Upload PNG/JPG images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 if not uploaded_files:
@@ -245,62 +355,110 @@ for i in range(0, len(uploaded_files), row_cols):
         img = Image.open(uploaded).convert("RGB")
         arr = np.array(img)
         image_tensor = preprocess_image(img, 224)
+        
+        # ============================================================
+        # STAGE 1: Oral/Non-oral Classification
+        # ============================================================
         is_oral = True
-
-        cls_prob = None
-        if classifier_model is not None:
+        stage1_prob = None
+        
+        if stage1_classifier_model is not None:
             with torch.no_grad():
-                cls_logits = classifier_model(image_tensor)
+                cls_logits = stage1_classifier_model(image_tensor)
                 cls_scores = F.softmax(cls_logits, dim=1)[0].cpu().numpy()
-                cls_prob = float(cls_scores[1])
-            is_oral = cls_prob >= classification_threshold
-
+                stage1_prob = float(cls_scores[1])
+            is_oral = stage1_prob >= stage1_threshold
+        
+        # ============================================================
+        # STAGE 2: Disease Classification (Normal | Lichen Planus | Other)
+        # ============================================================
+        stage2_pred = None
+        stage2_prob = None
+        stage2_disease_name = None
+        
+        if stage2_classifier_model is not None and is_oral:
+            with torch.no_grad():
+                disease_logits = stage2_classifier_model(image_tensor)
+                disease_scores = F.softmax(disease_logits, dim=1)[0].cpu().numpy()
+                stage2_pred = int(torch.argmax(disease_logits[0], dim=0).cpu())
+                stage2_prob = float(disease_scores[stage2_pred])
+                stage2_disease_name = stage2_class_mapping.get(stage2_pred, f"Class {stage2_pred}")
+        
+        # ============================================================
+        # STAGE 3: Segmentation (only for Lichen Planus predictions)
+        # ============================================================
         small = img.resize((256, 256))
         input_tensor = preprocess_image(small, 256)
 
         overlay = arr.copy()
         pred_resized = np.zeros((arr.shape[0], arr.shape[1]), dtype=np.uint8)
-
-        if is_oral:
-            with torch.no_grad():
-                logits = unet_model(input_tensor)
-                if logits.shape[1] == 1:
-                    prob = torch.sigmoid(logits)[0, 0].cpu().numpy()
-                else:
-                    prob = F.softmax(logits, dim=1)[0, 1].cpu().numpy()
-            pred = (prob > segmentation_threshold).astype(np.uint8) * 255
-            pred_resized = np.array(Image.fromarray(pred).resize((arr.shape[1], arr.shape[0]), Image.NEAREST))
-            red_mask = np.zeros_like(overlay)
-            red_mask[pred_resized == 255] = [255, 0, 0]
-            overlay = (overlay * 0.8 + red_mask * 0.2).astype(np.uint8)
+        
+        # Only segment if: (1) is oral, (2) Stage 2 predicts Lichen Planus or Stage 2 disabled
+        should_segment = is_oral and (
+            stage2_classifier_model is None or 
+            (stage2_pred == 1 and stage2_prob >= stage2_threshold)  # 1 = Lichen Planus
+        )
 
         col = cols[j]
         with col:
             st.markdown(f"#### {uploaded.name}")
             show_responsive_image(arr, caption="Uploaded image")
-
-            if classifier_model is not None:
+            
+            # Show Stage 1 result
+            if stage1_classifier_model is not None:
                 if is_oral:
                     st.markdown(
-                        f"<span style='color:blue; font-weight:bold'>Classifier: oral image ({cls_prob:.2f}) — running U-Net</span>",
+                        f"<span style='color:blue; font-weight:bold'>✓ Stage 1: Oral ({stage1_prob:.2f})</span>",
                         unsafe_allow_html=True,
                     )
                 else:
                     st.markdown(
-                        f"<span style='color:orange; font-weight:bold'>Classifier: not oral ({cls_prob:.2f}) — skipping U-Net</span>",
+                        f"<span style='color:orange; font-weight:bold'>✗ Stage 1: Non-oral ({stage1_prob:.2f})</span>",
                         unsafe_allow_html=True,
                     )
-                st.caption(f"Classification threshold: {classification_threshold:.2f}")
-
+            
+            # Show Stage 2 result
+            if stage2_classifier_model is not None and is_oral:
+                color_map = {"Normal": "green", "Lichen Planus": "red", "Other": "orange"}
+                color = color_map.get(stage2_disease_name, "gray")
+                st.markdown(
+                    f"<span style='color:{color}; font-weight:bold'>→ Stage 2: {stage2_disease_name} ({stage2_prob:.2f})</span>",
+                    unsafe_allow_html=True,
+                )
+                if stage2_pred == 1 and stage2_prob >= stage2_threshold:
+                    st.markdown(f"<span style='color:red; font-weight:bold'>  ✓ Proceed to segmentation</span>", unsafe_allow_html=True)
+                else:
+                    st.markdown(f"<span style='color:gray; font-weight:bold'>  ✗ Skip segmentation</span>", unsafe_allow_html=True)
+            
+            # If Stage 1 filtered out (non-oral), skip segmentation
             if not is_oral:
-                st.warning("Skipped U-Net: image classified as not oral.")
+                st.warning("Skipped: classified as non-oral (Stage 1).")
                 continue
-
-            if pred_resized.max() > 0:
-                st.markdown('<span style="color:red; font-weight:bold">Segmentation predicted: lichen</span>', unsafe_allow_html=True)
-                show_responsive_image(overlay, caption="Overlay")
-            else:
-                st.markdown('<span style="color:green; font-weight:bold">Segmentation predicted: no lesion</span>', unsafe_allow_html=True)
-                show_responsive_image(overlay, caption="No oral lesion found")
+            
+            # If Stage 2 filtered out (not Lichen Planus), skip segmentation
+            if stage2_classifier_model is not None and (stage2_pred != 1 or stage2_prob < stage2_threshold):
+                st.warning(f"Skipped segmentation: classified as {stage2_disease_name} (Stage 2).")
+                continue
+            
+            # Run segmentation if not filtered
+            if should_segment:
+                with torch.no_grad():
+                    logits = unet_model(input_tensor)
+                    if logits.shape[1] == 1:
+                        prob = torch.sigmoid(logits)[0, 0].cpu().numpy()
+                    else:
+                        prob = F.softmax(logits, dim=1)[0, 1].cpu().numpy()
+                pred = (prob > segmentation_threshold).astype(np.uint8) * 255
+                pred_resized = np.array(Image.fromarray(pred).resize((arr.shape[1], arr.shape[0]), Image.NEAREST))
+                red_mask = np.zeros_like(overlay)
+                red_mask[pred_resized == 255] = [255, 0, 0]
+                overlay = (overlay * 0.8 + red_mask * 0.2).astype(np.uint8)
+                
+                if pred_resized.max() > 0:
+                    st.markdown('<span style="color:red; font-weight:bold">→ Stage 3: Lesion detected</span>', unsafe_allow_html=True)
+                    show_responsive_image(overlay, caption="Overlay")
+                else:
+                    st.markdown('<span style="color:green; font-weight:bold">→ Stage 3: No lesion</span>', unsafe_allow_html=True)
+                    show_responsive_image(overlay, caption="No lesion found")
 
 st.success("Done. Predictions shown above.")
