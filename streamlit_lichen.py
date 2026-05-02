@@ -10,6 +10,11 @@ import segmentation_models_pytorch as smp
 from PIL import Image
 import io
 import base64
+import json
+import hashlib
+import zipfile
+from datetime import datetime
+from pathlib import Path
 
 # ---------------------------------------------------------
 # Force CPU mode to avoid GPU memory issues
@@ -46,12 +51,317 @@ def show_responsive_image(arr, caption=None):
     st.markdown(html, unsafe_allow_html=True)
 
 
-# Segmentation model selection
+def create_feedback_zip():
+    """Create a zip file of all feedback data"""
+    feedback_dir = Path("feedback_data")
+    
+    if not feedback_dir.exists() or not any(feedback_dir.glob('**/*')):
+        return None
+    
+    zip_path = Path("feedback_data.zip")
+    
+    # Remove existing zip if present
+    if zip_path.exists():
+        zip_path.unlink()
+    
+    # Create zip with all feedback data
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for file_path in feedback_dir.rglob('*'):
+            if file_path.is_file():
+                arcname = file_path.relative_to(feedback_dir.parent)
+                zipf.write(file_path, arcname)
+    
+    return zip_path
+
+
+# # =================================================================
+# # SIDEBAR: Feedback Data Download
+# # =================================================================
+# with st.sidebar:
+#     st.header("📊 Feedback Management")
+    
+#     if st.button("📥 Download Feedback Data (ZIP)", use_container_width=True, help="Download all collected feedback images and metadata"):
+#         zip_path = create_feedback_zip()
+        
+#         if zip_path and zip_path.exists():
+#             with open(zip_path, 'rb') as f:
+#                 st.download_button(
+#                     label="⬇️ Click to download feedback_data.zip",
+#                     data=f.read(),
+#                     file_name=f"feedback_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+#                     mime="application/zip",
+#                     use_container_width=True
+#                 )
+            
+#             # Show feedback stats
+#             feedback_dir = Path("feedback_data")
+#             if feedback_dir.exists():
+#                 total_files = sum(1 for _ in feedback_dir.rglob('*') if _.is_file())
+#                 st.success(f"✓ {total_files} feedback items ready for download")
+#         else:
+#             st.info("No feedback data collected yet.")
+    
+#     # st.divider()
+
+
+
+
+def get_image_id(filename):
+    """Generate unique image ID from filename."""
+    return hashlib.md5(filename.encode()).hexdigest()[:12]
+
+
+def resolve_folder(feedback_type, reason=None):
+    """
+    Resolve target folder based on feedback type and reason.
+    
+    Returns:
+        str: Path to target folder
+    """
+    base_path = Path("feedback_data")
+    
+    if feedback_type == "Correct":
+        folder = base_path / "Success_Data"
+    elif feedback_type == "Incorrect":
+        if reason == "Not mouth image":
+            folder = base_path / "Stage1_Hard_Negative"
+        elif reason == "Wrong disease":
+            folder = base_path / "Stage2_Hard_Negative"
+        elif reason == "Bad mask":
+            folder = base_path / "Stage3_Hard_Negative"
+        else:
+            folder = base_path / "General_Feedback"
+    else:
+        folder = base_path / "General_Feedback"
+    
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def save_feedback_image(image_array, image_id, feedback_type, reason=None, original_filename=None):
+    """
+    Save image to appropriate feedback folder.
+    
+    Args:
+        image_array: numpy array of image
+        image_id: unique image identifier
+        feedback_type: "Correct" or "Incorrect"
+        reason: reason for incorrect feedback (if applicable)
+        original_filename: original filename for reference
+    
+    Returns:
+        str: Path where image was saved
+    """
+    folder = resolve_folder(feedback_type, reason)
+    
+    # Create filename: image_id_timestamp.png
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{image_id}_{timestamp}.png"
+    filepath = folder / filename
+    
+    # Save image
+    pil_image = Image.fromarray(image_array.astype(np.uint8))
+    pil_image.save(filepath)
+    
+    return str(filepath)
+
+
+def save_feedback_metadata(metadata):
+    """
+    Save feedback metadata as JSON.
+    
+    Args:
+        metadata: dict containing feedback info
+            {
+                'image_id': str,
+                'original_filename': str,
+                'prediction': dict,
+                'feedback': str,
+                'reason': str or None,
+                'correct_class': str or None,
+                'timestamp': str,
+                'model_version': str,
+                'image_path': str
+            }
+    """
+    folder = resolve_folder(metadata.get("feedback"), metadata.get("reason"))
+    metadata_file = folder / f"{metadata['image_id']}_metadata.json"
+    
+    # Ensure prediction dict is JSON serializable
+    safe_metadata = {
+        'image_id': metadata['image_id'],
+        'original_filename': metadata.get('original_filename'),
+        'prediction': {
+            'stage1_oral': float(metadata['prediction'].get('stage1_prob', 0)),
+            'stage2_disease': metadata['prediction'].get('stage2_disease_name', 'N/A'),
+            'stage2_confidence': float(metadata['prediction'].get('stage2_prob', 0)),
+            'stage3_segmented': metadata['prediction'].get('stage3_segmented', False),
+        },
+        'feedback': metadata.get('feedback'),
+        'reason': metadata.get('reason'),
+        'correct_class': metadata.get('correct_class'),
+        'timestamp': metadata.get('timestamp'),
+        'model_version': metadata.get('model_version', '1.0'),
+        'models_used': metadata.get('models_used', {}),
+    }
+    
+    with open(metadata_file, 'w') as f:
+        json.dump(safe_metadata, f, indent=2)
+    
+    return str(metadata_file)
+
+
+def render_feedback_widget(col, image_array, image_id, predictions, uploaded_filename, models_used=None):
+    """
+    Render feedback widget for an image card.
+    
+    Args:
+        col: Streamlit column object
+        image_array: numpy array of original image
+        image_id: unique image identifier
+        predictions: dict with prediction info
+            {
+                'stage1_prob': float,
+                'stage2_disease_name': str,
+                'stage2_prob': float,
+                'stage3_segmented': bool
+            }
+        uploaded_filename: original uploaded filename
+        models_used: dict with model filenames used
+            {
+                'stage1_model': str,
+                'stage2_model': str,
+                'stage3_model': str
+            }
+    """
+    with col:
+        st.divider()
+        st.markdown("📋 Feedback")
+        
+        # Initialize session state for this image
+        feedback_key = f"feedback_{image_id}"
+        reason_key = f"reason_{image_id}"
+        correct_class_key = f"correct_class_{image_id}"
+        submit_key = f"submit_{image_id}"
+        submitted_key = f"submitted_{image_id}"
+        
+        if feedback_key not in st.session_state:
+            st.session_state[feedback_key] = "Correct"
+        if reason_key not in st.session_state:
+            st.session_state[reason_key] = None
+        if correct_class_key not in st.session_state:
+            st.session_state[correct_class_key] = None
+        if submitted_key not in st.session_state:
+            st.session_state[submitted_key] = False
+        
+        # Check if feedback already submitted for this image
+        if st.session_state[submitted_key]:
+            st.info(f"✓ Thank you! Your feedback has been recorded.")
+            return
+        
+        # Main feedback radio
+        feedback = st.radio(
+            "Is the prediction correct?",
+            ["Correct", "Incorrect"],
+            key=feedback_key,
+            horizontal=True,
+            index=0 if st.session_state[feedback_key] == "Correct" else 1
+        )
+        
+        # Show reason dropdown only if Incorrect
+        if feedback == "Incorrect":
+            st.radio(
+                "What was incorrect?",
+                ["Not mouth image", "Wrong disease", "Bad mask"],
+                key=reason_key,
+                index=0 if st.session_state[reason_key] is None else 
+                      ["Not mouth image", "Wrong disease", "Bad mask"].index(st.session_state[reason_key])
+            )
+            
+            # Show correct class selector if "Wrong disease" is selected
+            current_reason = st.session_state.get(reason_key)
+            if current_reason == "Wrong disease":
+                st.selectbox(
+                    "What should the correct class be?",
+                    ["Lichen", "Normal", "Other"],
+                    key=correct_class_key,
+                    index=0 if st.session_state[correct_class_key] is None else
+                          ["Lichen", "Normal", "Other"].index(st.session_state[correct_class_key])
+                )
+        
+        # Determine whether all required feedback fields are filled
+        current_feedback = st.session_state[feedback_key]
+        current_reason = st.session_state.get(reason_key)
+        current_correct_class = st.session_state.get(correct_class_key)
+        can_submit = False
+        submit_help = "Select the required feedback options to enable submit."
+
+        if current_feedback == "Correct":
+            can_submit = True
+        elif current_feedback == "Incorrect":
+            if current_reason == "Wrong disease":
+                can_submit = bool(current_correct_class)
+                submit_help = "Select the correct class before submitting."
+            else:
+                can_submit = bool(current_reason)
+                submit_help = "Select the reason for incorrect feedback before submitting."
+
+        if can_submit:
+            if st.button("Submit Feedback", key=submit_key, use_container_width=True):
+                try:
+                    # Save image to appropriate folder
+                    image_path = save_feedback_image(
+                        image_array,
+                        image_id,
+                        current_feedback,
+                        current_reason,
+                        uploaded_filename
+                    )
+                    
+                    # Prepare metadata
+                    metadata = {
+                        'image_id': image_id,
+                        'original_filename': uploaded_filename,
+                        'prediction': {
+                            'stage1_prob': predictions.get('stage1_prob'),
+                            'stage2_disease_name': predictions.get('stage2_disease_name'),
+                            'stage2_prob': predictions.get('stage2_prob'),
+                            'stage3_segmented': predictions.get('stage3_segmented'),
+                        },
+                        'feedback': current_feedback,
+                        'reason': current_reason,
+                        'correct_class': current_correct_class,
+                        'timestamp': datetime.now().isoformat(),
+                        'model_version': models_used.get('stage3_model') if models_used else '1.0',
+                        'models_used': models_used if models_used else {},
+                    }
+                    
+                    # Save metadata JSON
+                    metadata_path = save_feedback_metadata(metadata)
+                    
+                    # Mark as submitted
+                    st.session_state[submitted_key] = True
+                    
+                    # Show success message
+                    st.success(
+                        f"✓ Feedback saved!\n\n"
+                        f"📁 Image: `{image_path}`\n\n"
+                        f"📄 Metadata: `{metadata_path}`"
+                    )
+                    
+                    # Rerun to show thank you message
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"❌ Error saving feedback: {str(e)}")
+        else:
+            st.info(submit_help)
+
 st.subheader("Segmentation Settings")
 segmentation_checkpoint = st.selectbox(
     "Segmentation model",
-    ["UNet.pth", "UNet_plusplus.pth"],
-    index=0,
+    ["UNet.pth", "UNet_plusplus.pth" ],
+    index=1,
     help="Select which segmentation model to use for lichen detection"
 )
 
@@ -69,12 +379,13 @@ use_stage1_classifier = st.checkbox("Enable Stage 1 (Oral/Non-oral filter)", val
 
 classifier_path = None
 classifier_arch = None
+classifier_checkpoint = None
 if use_stage1_classifier:
     classifier_checkpoint = st.selectbox(
         "Stage 1 Classifier model",
         ["oral_classifier_mobilenetv3_small_100.pth", "oral_classifier_resnet18.pth", 
          "oral_classifier_resnet34.pth", "oral_classifier_resnet50.pth"],
-        index=0,
+        index=3,
         help="Select which classifier model to use for oral/non-oral classification"
     )
     
@@ -95,11 +406,12 @@ st.subheader("Stage 2: Disease Classifier (Normal | Lichen Planus | Other)")
 use_stage2_classifier = st.checkbox("Enable Stage 2 (Disease classification)", value=True, help="Enable disease classification (Normal/Lichen Planus/Other)")
 
 stage2_classifier_path = None
+stage2_checkpoint = None
 if use_stage2_classifier:
     stage2_checkpoint = st.selectbox(
         "Stage 2 Classifier model",
-        ["stage2_classifier.pth"],
-        index=0,
+        ["stage2_classifier_v2.pth", "stage2_classifier_v3.pth"],
+        index=1,
         help="Select Stage 2 disease classifier model"
     )
     stage2_classifier_path = f"model/{stage2_checkpoint}"
@@ -341,6 +653,34 @@ elif use_stage2_classifier:
 else:
     st.info("Stage 2 disabled.")
 
+# =================================================================
+# Feedback Data Download
+# =================================================================
+st.header("📊 Feedback Management")
+st.info("Click download after finishing all feedback submission to get a ZIP of all feedback data (images + json) organized by category.")
+    
+if st.button("📥 Download Feedback Data (ZIP)", use_container_width=True, help="Download all collected feedback images and metadata"):
+    zip_path = create_feedback_zip()
+    
+    if zip_path and zip_path.exists():
+        with open(zip_path, 'rb') as f:
+            st.download_button(
+                label="⬇️ Click to download feedback_data.zip",
+                data=f.read(),
+                file_name=f"feedback_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                mime="application/zip",
+                use_container_width=True
+            )
+        
+        # Show feedback stats
+        feedback_dir = Path("feedback_data")
+        if feedback_dir.exists():
+            total_files = sum(1 for _ in feedback_dir.rglob('*') if _.is_file())
+            st.success(f"✓ {total_files} feedback items ready for download")
+    else:
+        st.info("No feedback data collected yet.")
+
+st.divider()
 uploaded_files = st.file_uploader("Upload PNG/JPG images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 if not uploaded_files:
     st.info("Upload images to run detection.")
@@ -354,6 +694,10 @@ for i in range(0, len(uploaded_files), row_cols):
     for j, uploaded in enumerate(uploaded_files[i:i+row_cols]):
         img = Image.open(uploaded).convert("RGB")
         arr = np.array(img)
+        
+        # Generate unique image ID
+        image_id = get_image_id(uploaded.name)
+        
         image_tensor = preprocess_image(img, 224)
         
         # ============================================================
@@ -392,6 +736,7 @@ for i in range(0, len(uploaded_files), row_cols):
 
         overlay = arr.copy()
         pred_resized = np.zeros((arr.shape[0], arr.shape[1]), dtype=np.uint8)
+        stage3_segmented = False
         
         # Only segment if: (1) is oral, (2) Stage 2 predicts Lichen Planus or Stage 2 disabled
         should_segment = is_oral and (
@@ -430,35 +775,46 @@ for i in range(0, len(uploaded_files), row_cols):
                 else:
                     st.markdown(f"<span style='color:gray; font-weight:bold'>  ✗ Skip segmentation</span>", unsafe_allow_html=True)
             
-            # If Stage 1 filtered out (non-oral), skip segmentation
-            if not is_oral:
-                st.warning("Skipped: classified as non-oral (Stage 1).")
-                continue
-            
-            # If Stage 2 filtered out (not Lichen Planus), skip segmentation
-            if stage2_classifier_model is not None and (stage2_pred != 1 or stage2_prob < stage2_threshold):
-                st.warning(f"Skipped segmentation: classified as {stage2_disease_name} (Stage 2).")
-                continue
-            
-            # Run segmentation if not filtered
-            if should_segment:
-                with torch.no_grad():
-                    logits = unet_model(input_tensor)
-                    if logits.shape[1] == 1:
-                        prob = torch.sigmoid(logits)[0, 0].cpu().numpy()
+            # Display segmentation results if applicable
+            if is_oral:
+                if should_segment:
+                    with torch.no_grad():
+                        logits = unet_model(input_tensor)
+                        if logits.shape[1] == 1:
+                            prob = torch.sigmoid(logits)[0, 0].cpu().numpy()
+                        else:
+                            prob = F.softmax(logits, dim=1)[0, 1].cpu().numpy()
+                    pred = (prob > segmentation_threshold).astype(np.uint8) * 255
+                    pred_resized = np.array(Image.fromarray(pred).resize((arr.shape[1], arr.shape[0]), Image.NEAREST))
+                    red_mask = np.zeros_like(overlay)
+                    red_mask[pred_resized == 255] = [255, 0, 0]
+                    overlay = (overlay * 0.8 + red_mask * 0.2).astype(np.uint8)
+                    
+                    if pred_resized.max() > 0:
+                        stage3_segmented = True
+                        st.markdown('<span style="color:red; font-weight:bold">→ Stage 3: Lesion detected</span>', unsafe_allow_html=True)
+                        show_responsive_image(overlay, caption="Overlay")
                     else:
-                        prob = F.softmax(logits, dim=1)[0, 1].cpu().numpy()
-                pred = (prob > segmentation_threshold).astype(np.uint8) * 255
-                pred_resized = np.array(Image.fromarray(pred).resize((arr.shape[1], arr.shape[0]), Image.NEAREST))
-                red_mask = np.zeros_like(overlay)
-                red_mask[pred_resized == 255] = [255, 0, 0]
-                overlay = (overlay * 0.8 + red_mask * 0.2).astype(np.uint8)
-                
-                if pred_resized.max() > 0:
-                    st.markdown('<span style="color:red; font-weight:bold">→ Stage 3: Lesion detected</span>', unsafe_allow_html=True)
-                    show_responsive_image(overlay, caption="Overlay")
+                        st.markdown('<span style="color:green; font-weight:bold">→ Stage 3: No lesion</span>', unsafe_allow_html=True)
+                        show_responsive_image(overlay, caption="No lesion found")
                 else:
-                    st.markdown('<span style="color:green; font-weight:bold">→ Stage 3: No lesion</span>', unsafe_allow_html=True)
-                    show_responsive_image(overlay, caption="No lesion found")
+                    if stage2_classifier_model is not None:
+                        st.warning(f"Skipped segmentation: classified as {stage2_disease_name} (Stage 2).")
+            else:
+                st.warning("Skipped: classified as non-oral (Stage 1).")
+            
+            # Render feedback widget
+            predictions = {
+                'stage1_prob': stage1_prob,
+                'stage2_disease_name': stage2_disease_name,
+                'stage2_prob': stage2_prob,
+                'stage3_segmented': stage3_segmented,
+            }
+            models_used = {
+                'stage1_model': classifier_checkpoint if use_stage1_classifier else None,
+                'stage2_model': stage2_checkpoint if use_stage2_classifier else None,
+                'stage3_model': segmentation_checkpoint,
+            }
+            render_feedback_widget(col, arr, image_id, predictions, uploaded.name, models_used)
 
 st.success("Done. Predictions shown above.")
