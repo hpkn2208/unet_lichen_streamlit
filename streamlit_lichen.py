@@ -53,8 +53,7 @@ def show_responsive_image(arr, caption=None):
 
 def get_image_id(filename):
     """Generate unique image ID from filename."""
-    timestamp = datetime.now().strftime("%H%M%S%f")
-    return hashlib.md5((filename + timestamp).encode()).hexdigest()[:12]
+    return hashlib.md5(filename.encode()).hexdigest()[:12]
 
 st.subheader("Segmentation Settings")
 segmentation_checkpoint = st.selectbox(
@@ -394,8 +393,11 @@ for i in range(0, len(uploaded_files), row_cols):
         img = Image.open(uploaded).convert("RGB")
         arr = np.array(img)
         
-        # Generate unique image ID
-        image_id = get_image_id(uploaded.name)
+        # Generate unique image ID (store in session state for stability)
+        image_id_key = f"image_id_{uploaded.name}"
+        if image_id_key not in st.session_state:
+            st.session_state[image_id_key] = get_image_id(uploaded.name)
+        image_id = st.session_state[image_id_key]
         
         image_tensor = preprocess_image(img, 224)
         
