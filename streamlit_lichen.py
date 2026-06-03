@@ -108,8 +108,8 @@ stage2_checkpoint = None
 if use_stage2_classifier:
     stage2_checkpoint = st.selectbox(
         "Stage 2 Classifier model",
-        ["stage2_classifier_v2.pth", "stage2_classifier_v3.pth"],
-        index=1,
+        ["stage2_classifier_v7.pth", "stage2_classifier_v3.pth", "stage2_classifier_v2.pth"],
+        index=0,
         help="Select Stage 2 disease classifier model"
     )
     stage2_classifier_path = f"model/{stage2_checkpoint}"
